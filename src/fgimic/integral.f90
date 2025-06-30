@@ -19,6 +19,7 @@ module integral_class
     ! ACID stuff
     use acid_module
     use tensor_module
+    use gpu_utils
     implicit none
 
     type integral_t
@@ -202,6 +203,7 @@ contains
         real(DP), dimension(3) :: jvec
         real(DP), dimension(9) :: tt
         type(jtensor_t) :: jt
+        logical :: gpu_available
 
         if (present(spinn)) spin = spinn
 
@@ -242,66 +244,14 @@ contains
         psum3=0.d0
         nsum3=0.d0
 
-!$OMP PARALLEL DEFAULT(NONE) &
-!$OMP PRIVATE(i,j,k,r,rr,sgn,xsum,psum,nsum) &
-!$OMP PRIVATE(jt,w,jp,tt,jvec) &
-!$OMP SHARED(p1,p2,p3,this,center,spin,bb,normal,lo,hi,bound,xdens,mol) &
-!$OMP REDUCTION(+:xsum3,psum3,nsum3,xsum2,psum2,nsum2)
-        call new_jtensor(jt, mol, xdens)
-        do k=1,p3
-            xsum2=0.d0
-            psum2=0.d0
-            nsum2=0.d0
-
-            !$OMP DO
-            do j=lo,hi
-                xsum=0.d0
-                psum=0.d0
-                nsum=0.d0
-                do i=1,p1
-                    rr=gridpoint(this%grid, i, j, k)
-                    r=sqrt(sum((rr-center)**2))
-                    call ctensor(jt, rr, tt, spin)
-                    jvec=matmul(reshape(tt,(/3,3/)),bb)
-                    if ( r > bound ) then
-                        w=0.d0
-                    else
-                        w=get_weight(this%grid, i, 1)
-                        jp=dot_product(normal,jvec)
-                        if (abs(jp) < 1.d-12) then ! prob. parallel component
-                            sgn=0.d0
-                        else if (jp > 0) then
-                            sgn=1.d0
-                        else
-                            sgn=-1.d0
-                        end if
-                    end if
-                    jp=sgn*sqrt(sum(jvec**2))
-                    xsum=xsum+jp*w
-                    if (jp > 0.d0) then
-                        psum=psum+jp*w
-                    else
-                        nsum=nsum+jp*w
-                    end if
-                end do
-                w=get_weight(this%grid,j,2)
-                xsum2=xsum2+xsum*w
-                psum2=psum2+psum*w
-                nsum2=nsum2+nsum*w
-            end do
-            !$OMP END DO
-
-            w = get_weight(this%grid,k,3)
-            xsum3 = xsum3 + w*xsum2
-            psum3 = psum3 + w*psum2
-            nsum3 = nsum3 + w*nsum2
-
-            ! TODO old code used collect_sum
-            ! this will be needed for MPI
-
-        end do
-        call del_jtensor(jt)
-!$OMP END PARALLEL
+        if (gpu_available) then
+            call msg_note("Current Mod Integration with GPU Acceleration")
+            call integrate_gpu()
+        else
+            call msg_note("Current Mod Integration on CPU ")
+            call integrate_cpu()
+        end if
+            
 
         call nl
         call msg_out(repeat('*', 60))
@@ -321,6 +271,81 @@ contains
         call msg_out(repeat('*', 60))
         call nl
         spin = 'total'
+
+    contains
+        subroutine integrate_cpu()
+!$OMP PARALLEL DEFAULT(NONE) &
+!$OMP PRIVATE(i,j,k,r,rr,sgn,xsum,psum,nsum) &
+!$OMP PRIVATE(jt,w,jp,tt,jvec) &
+!$OMP SHARED(p1,p2,p3,this,center,spin,bb,normal,lo,hi,bound,xdens,mol) &
+!$OMP REDUCTION(+:xsum3,psum3,nsum3,xsum2,psum2,nsum2)
+            call new_jtensor(jt, mol, xdens)
+            do k=1,p3
+                xsum2=0.d0
+                psum2=0.d0
+                nsum2=0.d0
+
+                !$OMP DO
+                do j=lo,hi
+                    xsum=0.d0
+                    psum=0.d0
+                    nsum=0.d0
+                    do i=1,p1
+                        rr=gridpoint(this%grid, i, j, k)
+                        r=sqrt(sum((rr-center)**2))
+                        call ctensor(jt, rr, tt, spin)
+                        jvec=matmul(reshape(tt,(/3,3/)),bb)
+                        if ( r > bound ) then
+                            w=0.d0
+                        else
+                            w=get_weight(this%grid, i, 1)
+                            jp=dot_product(normal,jvec)
+                            if (abs(jp) < 1.d-12) then ! prob. parallel component
+                                sgn=0.d0
+                            else if (jp > 0) then
+                                sgn=1.d0
+                            else
+                                sgn=-1.d0
+                            end if
+                        end if
+                        jp=sgn*sqrt(sum(jvec**2))
+                        xsum=xsum+jp*w
+                        if (jp > 0.d0) then
+                            psum=psum+jp*w
+                        else
+                            nsum=nsum+jp*w
+                        end if
+                    end do
+                    w=get_weight(this%grid,j,2)
+                    xsum2=xsum2+xsum*w
+                    psum2=psum2+psum*w
+                    nsum2=nsum2+nsum*w
+                end do
+                !$OMP END DO
+
+                w = get_weight(this%grid,k,3)
+                xsum3 = xsum3 + w*xsum2
+                psum3 = psum3 + w*psum2
+                nsum3 = nsum3 + w*nsum2
+
+                ! TODO old code used collect_sum
+                ! this will be needed for MPI
+
+            end do
+            call del_jtensor(jt)
+!$OMP END PARALLEL
+        end subroutine
+
+        subroutine integrate_gpu()
+            implicit none
+            type(gpu_integral_t), device :: gpu_integral
+
+            call copy_data_gpu(gpu_integral, mol, xdens, p1, p2, p3, spin, bb, &
+            center, normal)
+            call integrate(gpu_integral)
+            
+        end subroutine
+
     end subroutine
 
     subroutine integrate_tensor_field(this, mol, xdens)

@@ -3,6 +3,9 @@ include_directories(
     ${CMAKE_BINARY_DIR}
     ${CMAKE_SOURCE_DIR}/src/pygimic)
 
+# Explicitly set PYTHON_LIBRARIES for the correct Conda environment
+set(PYTHON3_LIBRARIES "/opt/anaconda3/envs/gimic/lib/libpython3.8.dylib")
+
 set(sources
     globals.f90
     basis.f90
@@ -55,6 +58,7 @@ if(ENABLE_MKL_FLAG)
         )
 endif()
 
+
 if (CYTHON_FOUND)
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/gimic.pxd
@@ -67,7 +71,7 @@ cython_add_module(gimic
     gimic.pyx
     )
 target_link_libraries(gimic
-    gimic2 ${PYTHON_LIBRARIES}
+    gimic2 ${PYTHON3_LIBRARIES}
     )
 
 cython_add_module(gengauss
@@ -75,7 +79,7 @@ cython_add_module(gengauss
     gengauss.pyx
     )
 target_link_libraries(gengauss
-    gimic2 ${PYTHON_LIBRARIES}
+    gimic2 ${PYTHON3_LIBRARIES}
     )
 install(TARGETS gimic gengauss
     ARCHIVE DESTINATION ${PYTHON_SITE_INSTALL_DIR}

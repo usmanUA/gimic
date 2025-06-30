@@ -1,7 +1,9 @@
+# cython: language_level=3
 from cython.operator cimport dereference as deref
 from connector cimport GimicConnector
 import numpy as np
 cimport gimic
+
 
 cdef class Gimic(GimicConnector):
     cdef gimic.GimicInterface *thisptr

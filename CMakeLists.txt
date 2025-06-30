@@ -87,6 +87,9 @@ endmacro()
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/custom)
 list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/downloaded)
 
+set(Python3_EXECUTABLE "/opt/anaconda3/envs/gimic/bin/python")
+set(CYTHON_EXECUTABLE "/opt/anaconda3/envs/gimic/bin/cython")
+
 find_package(Python3 COMPONENTS Interpreter Development NumPy)
 include_directories(${Python3_INCLUDE_DIRS})
 include_directories(${Python3_NumPy_INCLUDE_DIRS})
