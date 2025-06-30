@@ -1,0 +1,555 @@
+module parallel_integral
+    use cudafor
+    use gpu_utils
+    use gpu_data
+    use kinds_module
+    use settings_module
+    implicit none
+
+! WARNING: WATCH FOR POINTERS ON GPU
+
+contains
+    attributes(global)    subroutine integrate_mod(gpu_integral)
+        type(gpu_integral_t), device :: gpu_integral
+        type(gpu_jtensor_t), device :: jt
+        integer(I4), device :: i, j, k
+        real(DP), dimension(3), device :: rr
+        real(DP), device :: psum, nsum, w, jp, r, bound, sgn
+        real(DP), dimension(9), device :: tt
+
+        init_jtensor(jt, gpu_integral%mol, gpu_integral%xdens)
+        i = blockIdx.x * blockDim.x + threadIdx.x + 1
+        j = blockIdx.y * blockDim.y + threadIdx.y + 1
+        k = blockIdx.z * blockDim.z + threadIdx.z + 1
+
+        if (i <= p1 .and. j <= p2 .and. k <= p3) then
+            rr = gridpoint_gpu(gpu_integral%grid, i, j, k)
+            r=sqrt(sum((rr-center)**2))  ! TODO: sum is not available in CUDA Fortran, define your own
+        call ctensor_gpu(jt, rr, tt, spin) ! TODO: DEFINE spin variable, where is it coming from?
+
+        end if
+
+    end subroutine
+
+
+    attributes(device) subroutine init_jtensor(jt, mol, xdens, ncgto)
+        type(gpu_molecule_t), target :: mol
+        type(gpu_dens_t), target :: xdens
+        integer(I4), intent(in), device :: ncgto
+
+        jt%mol => mol
+        jt%xdens => xdens
+
+        call init_bfeval(jt%basv, jt%mol, ncgto)
+
+        ! intermediates
+        allocate(jt%denbf(ncgto))
+        allocate(jt%dendb(ncgto))
+        allocate(jt%pdbf(ncgto))
+    end subroutine init_jtensor
+
+    attributes(device) subroutine init_bfeval(basv, mol, ncgto)
+        type(gpu_bfeval_t), intent(inout), device :: basv
+
+        basv%mol => mol
+
+        ! Allocate and initialize other fields as needed
+        allocate(basv%bf(ncgto))
+        allocate(basv%dbop(3,mol%natoms))
+        allocate(basv%d2(ncgto,9))
+        allocate(basv%db(ncgto,3))
+        allocate(basv%dr(mol%nccgto,3))
+        if (settings%use_spherical) allocate(basv%sdr(ncgto,3))
+        if (settings%use_spherical) allocate(basv%sbf(mol%nccgto))
+
+    end subroutine init_bfeval
+
+    attributes(device) function gridpoint_gpu(grid, i, j, k) result(rr)
+
+        if (grid%gtype == 'file') then
+            r=grid%xdata(:,i)
+        else
+            r=grid%origin+&
+              grid%gdata(1)%pts(i)*grid%basv(:,1)+&
+              grid%gdata(2)%pts(j)*grid%basv(:,2)+&
+              grid%gdata(3)%pts(k)*grid%basv(:,3)
+        end if
+
+    end function gridpoint_gpu
+
+    attributes(device) subroutine ctensor_gpu(jt, rr, tt, spin)
+        real(DP), dimension(9), device :: jt1, jt2
+
+        select case (op)
+            case ('alpha')
+                call jtensor_gpu(jt, rr, j, spin_a)
+            case ('beta')
+                if (settings%is_uhf) then
+                    call jtensor_gpu(jt, rr, j, spin_b)
+                else
+                    call msg_error('ctensor(): &
+                    &beta current requested, but not open-shell system!')
+                    stop
+                end if
+            case ('total')
+                if (settings%is_uhf) then
+                    call jtensor_gpu(jt, rr, jt1, spin_a)
+                    call jtensor_gpu(jt, rr, jt2, spin_b)
+                    j=jt1+jt2
+                else
+                    call jtensor_gpu(jt, rr, j, spin_a)
+                end if
+            case ('spindens')
+                if (.not.settings%is_uhf) then
+                    call msg_error('ctensor(): &
+                    &spindens requested, but not open-shell system!')
+                    stop
+                end if
+                call jtensor_gpu(jt, rr, jt1, spin_a)
+                call jtensor_gpu(jt, rr, jt2, spin_b)
+                j=jt1-jt2
+        end select
+    end subroutine ctensor_gpu
+
+    attributes(device) subroutine jtensor_gpu(jt, rr, j, spin)
+        integer(I4) :: b
+
+        jt%rho=DP50*r ! TODO: needed for diamag. contr. -> It is currently not available on GPU, copy to GPU memory
+        if (settings%use_giao) then  ! TODO: settings type is not available on GPU, copy to GPU memory
+            call gpu_calc_basis(jt%basv, rr, jt%bfvec, jt%drvec, &
+            jt%dbvec, jt%d2fvec)
+        else
+            call gpu_calc_basis(jt%basv, rr, jt%bfvec, jt%drvec)
+        end if
+
+        call gpu_contract(jt, j, spin)
+    end subroutine jtensor_gpu
+
+    attributes(device) subroutine gpu_calc_basis(basv, rr, bf, dr, db, d2)
+        real(DP), dimension(:), pointer, device :: bf
+        real(DP), dimension(:,:), pointer, device, optional :: dr
+        real(DP), dimension(:,:), pointer, device, optional :: db, d2
+
+        call gpu_bfeval(basv, rr, bf)
+        if (present(dr)) then
+            call gpu_dfdr(basv, rr, dr) ! TODO: Implement this function for GPU
+        endif
+        if (present(db)) then
+            call gpu_mkdbop(basv, rr) ! TODO: Implement this function for GPU
+            call gpu_dfdb(basv, bf, db) ! TODO: Implement this function for GPU
+        endif
+        if (present(d2)) then
+            call gpu_d2fdrdb(basv, bf, dr, d2) ! TODO: Implement this function for GPU
+        endif
+
+    end subroutine gpu_calc_basis
+
+    attributes(device) subroutine gpu_bfeval(basv, r, bf)
+        integer(I4), dimension(99), device :: posvec
+        integer(I4), device :: idx1, idx2
+
+        integer(I4), device :: l, m, n, natoms, nctr, ncomp, nccomp, idx
+        type(gpu_atom_t), pointer, device :: atom
+        type(gpu_basis_t), pointer, device :: basis
+        type(gpu_contraction_t), pointer, device :: ctr
+        real(DP), dimension(3), device :: rr_an, coord
+
+        natoms=basv%mol%natoms
+
+        idx=1
+        idx2=0
+        posvec=0
+        basv%bf=0.d0
+        if (settings%use_spherical) basv%sbf=0.d0 ! TODO: settings type is not available on GPU, copy to GPU memory
+        do l=1,natoms
+            atom=>basv%mol%atoms(l)
+            coord = atom%coord
+            basis=>atom%basis
+            rr_an=r-coord
+            call gpu_filter_screened(basis, rr_an, posvec, nctr) ! TODO: define filter_screened for GPU
+            do n=1,nctr
+                m=posvec(n)
+                ctr=>atom%basis%ctr(m)
+                idx=idx2+basis%pos(m)
+                call gpu_cgto(rr, ctr, basv%bf(idx:)) ! TODO: define cgto for GPU
+            end do
+            idx2=idx2+basis%ncgto
+        end do
+        if (settings%use_spherical) then  ! TODO: settings type is not available on GPU, copy to GPU memory
+            basv%sbf=matmul(basv%mol%c2s%po,basv%bf)
+            bf=>basv%sbf
+        else
+            bf=>basv%bf
+        end if
+        
+    end subroutine gpu_bfeval
+
+    attributes(device) subroutine gpu_contract(jt, j, spin)
+
+
+        integer(I4), device :: a, ll, mm, nn, ii,jj
+        integer(I4), device :: vec_size
+        real(DP), device :: prsp1, prsp2       ! paramagnetic wavefunction response
+        real(DP), device :: ppd                ! paramagnetic probability density
+        real(DP), dimension(3), device :: dpd  ! diamagnetic probability density
+        real(DP), device :: diapam
+        real(DP), device :: ddot
+
+        call gpu_get_dens(jt%xdens, jt%aodens, spin) ! WARN: BE CAREFUL here
+#ifdef HAVE_BLAS
+        ! NOTE: Take care of the different vaiables and function calls in this block
+        vec_size = size(jt%bfvec) ! WARN: is size available on GPU?
+        call cublasDgemv('n', vec_size, vec_size, 1.0d0, jt%aodens, vec_size, jt%bfvec, 1, 0.0d0, jt%denbf, 1)
+        diapam = cublasDdot(vec_size, jt%denbf, 1, jt%bfvec, 1)
+#else
+        ! NOTE: Take care of the different vaiables and function calls in this block
+        jt%denbf=matmul(jt%bfvec, jt%aodens)
+        diapam=dot_product(jt%denbf, jt%bfvec)
+#endif
+
+        nn=1
+        do a=1,3! dB <x,y,z>
+            ! get perturbed densities: x,y,z
+            call get_pdens(jt%xdens, a, jt%pdens, spin) ! TODO: define get_pdens for GPU
+#ifdef HAVE_BLAS
+        ! NOTE: Take care of the different vaiables and function calls in this block
+            call cublasDgemv('t', vec_size, vec_size, 1.0d0, jt%pdens, vec_size, jt%bfvec, 1, 0.0d0, jt%pdbf, 1)
+#else
+        ! NOTE: Take care of the different vaiables and function calls in this block
+            jt%pdbf=matmul(jt%bfvec, jt%pdens)
+#endif
+            if (settings%use_giao) then ! TODO: settings type is not available on GPU, copy to GPU memory
+#ifdef HAVE_BLAS
+        ! NOTE: Take care of the different vaiables and function calls in this block
+              call cublasDgemv('n', vec_size, vec_size, 1.0d0, jt%aodens, vec_size, jt%dbvec(:,a), 1, 0.0d0, jt%dendb, 1)
+#else
+        ! NOTE: Take care of the different vaiables and function calls in this block
+              jt%dendb=matmul(jt%dbvec(:,a), jt%aodens)
+#endif
+            end if
+            dpd(a)=diapam*jt%rho(a) ! diamag. contr. to J
+            do mm=1,3 !dm <x,y,z>
+
+              ! we zero these out to avoid compiler warning us that these may be used uninitialized
+              prsp1 = 0.0d0
+              prsp2 = 0.0d0
+
+              if (settings%use_giao) then ! TODO: settings type is not available on GPU, copy to GPU memory
+#ifdef HAVE_BLAS
+        ! NOTE: Take care of the different vaiables and function calls in this block
+                ! (-i)**2 = -1
+                prsp1 = -cublasDdot(vec_size, jt%dendb, 1, jt%drvec(1, ll), 1) 
+                prsp2 = cublasDdot(vec_size, jt%denbf, 1, jt%d2fvec(1, nn), 1) 
+#else
+        ! NOTE: Take care of the different vaiables and function calls in this block
+                prsp1=-dot_product(jt%dendb, jt%drvec(:,ll)) ! (-i)**2=-1
+                prsp2=dot_product(jt%denbf, jt%d2fvec(:,nn)) 
+#endif
+              end if
+#ifdef HAVE_BLAS
+        ! NOTE: Take care of the different vaiables and function calls in this block
+              ppd = cublasDdot(vec_size, jt%pdbf, 1, jt%drvec(1, ll), 1) 
+#else
+        ! NOTE: Take care of the different vaiables and function calls in this block
+              ppd=dot_product(jt%pdbf, jt%drvec(:,ll)) 
+#endif
+              ct(ll,a)=ZETA*ppd
+              if (settings%use_giao) ct(ll,a)=ct(ll,a)+ZETA*(prsp1+prsp2) ! TODO: settings type is not available on GPU, copy to GPU memory
+              nn=nn+1
+            end do
+        end do
+
+
+! Calculate the total J tensor. The diamagnetic pobability density only
+! contributes to the diagonal.
+
+        ! annihilate paramagnetic contribution
+        if (.not.settings%use_paramag) then ! TODO: settings type is not available on GPU, copy to GPU memory
+            ct=D0 ! TODO:  D0 is currently not available on GPU, copy to GPU memory
+            your_results_are_questionable = .true.
+        end if
+        ! annihilate diamagnetic  contribution
+        if (.not.settings%use_diamag) then
+            dpd=D0 ! TODO:  D0 is currently not available on GPU, copy to GPU memory
+            your_results_are_questionable = .true.
+        end if
+
+        ct(1,2)=ct(1,2)+dpd(3)
+        ct(1,3)=ct(1,3)-dpd(2)
+        ct(2,1)=ct(2,1)-dpd(3)
+        ct(2,3)=ct(2,3)+dpd(1)
+        ct(3,1)=ct(3,1)+dpd(2)
+        ct(3,2)=ct(3,2)-dpd(1)
+    end subroutine gpu_contract
+
+
+! NOTE: GPU: return an index vector with congtributing contractions after screening has
+! been applied
+!
+    attributes(device) subroutine gpu_filter_screened(basis, rr_an, posvec, nctr)
+
+        real(DP), device :: r2
+        integer(I4), device :: i1,j1
+
+        r2=sqrt(sum(rr_an**2)) ! TODO: sum is not available in CUDA Fortran, define your own
+        j1=1
+        do i1=1,basis%nctr
+            if (r2 <= basis%thrs(i1) ) then
+                posvec(j1)=i1
+                j1=j1+1
+            end if
+        end do
+        nctr=j1-1
+    end subroutine
+
+    attributes(device) subroutine gpu_cgto(r, ctr, val)
+
+        real(DP) :: p
+        real(DP) :: q
+        integer(I4) :: i2
+        real(DP), dimension(:,:), pointer :: f
+        real(DP) :: rr2
+
+        rr2=sum(r**2) ! TODO: sum is not available in CUDA Fortran, define your own
+
+!        call get_gto_nlm(ctr%l, f) ! TODO: Figure out what is GTO_DEFS, where is it defined?
+        q=gpu_cao(ctr, rr2)
+        do i=1,ctr%nccomp
+            p=product(r**GTO_DEFS(ctr%l)%nlm(:,i))*q ! WARN: Direct access to nlm, no pointer assignment via get_gto_nlm
+!            if (abs(p) > 1.d-20) val(i)=p
+            val(i)=p
+        end do
+    end subroutine
+
+    ! Evaluate one contracted CAO
+    attributes(device) function gpu_cao(ctr, rr2) result(ff)
+        real(DP) :: ff ! TODO: DP might not be available on device
+
+        integer(I4) :: i3
+
+        ff=D0 ! TODO: D0 is not available in CUDA Fortran, define your own
+        do i=1,ctr%npf
+        ff=ff+ctr%ncc(i3)*exp(-ctr%xp(i3)*rr2) ! TODO: if exp is not available in CUDA Fortran, define your own
+        end do
+
+    end function
+
+    subroutine gpu_get_dens(this, aodens, spin)
+        type(gpu_dens_t) :: this
+        real(DP), device, pointer :: aodens
+        integer(I4), optional :: spin
+
+        if (present(spin)) then
+            if (spin == spin_b) then
+                aodens=>this%db(:,:,0)
+            else
+                aodens=>this%da(:,:,0)
+            end if
+        else
+            aodens=>this%da(:,:,0)
+        end if
+    end subroutine
+
+    subroutine gpu_cao2sao(c2s, bf, sbf)
+        type(gpu_cao2sao_t) :: c2s
+        real(DP), dimension(:), intent(in) :: bf
+        real(DP), dimension(:), intent(out) :: sbf
+
+        sbf=matmul(c2s%po,bf)
+    end subroutine
+
+    subroutine gpu_dfdr(this, r1, drv)
+        type(gpu_bfeval_t), intent(inout), device :: this
+        real(DP), dimension(:,:), pointer, device :: drv
+        real(DP), dimension(3), intent(in) :: r1
+
+        integer(I4), dimension(99) :: possvec
+        integer(I4) :: idx3, idx4
+
+        integer(I4) :: i5, j2, k1, n_atoms, n_ctr, n_ccomp, axis
+        type(gpu_atom_t), pointer, device :: atom1
+        type(gpu_basis_t), pointer, device :: basis1
+        type(gpu_contraction_t), pointer, device :: ctr1
+        real(DP), dimension(3) :: rr1, coord1 
+
+        n_atoms=this%mol%natoms
+
+        idx4=0
+        this%dr=0.d0
+        do i5=1,n_atoms
+            atom1=>this%mol%atoms(i5)
+            coord1 = atom1%coord
+            rr1=r1-coord1
+            basis1=>atom%basis
+            call filter_screened(basis1, rr1, possvec, n_ctr)
+            do k1=1,n_ctr
+                j2=possvec(k1)
+                ctr1=>basis1%ctr(j2) ! WARN: REPLACED GET_CONTRACTION 
+                idx3=idx4+basis1%pos(j2)
+                do axis=1,3
+                    call gpu_dcgto(rr1, ctr1, axis, this%dr(idx3:, axis))
+                end do
+            end do
+            idx4=idx4+basis%ncgto
+        end do
+        if (settings%use_spherical) then
+            do axis=1,3
+                this%sdr(:,axis) = matmul(this%mol%c2s%po, this%dr(:, axis))
+            end do
+            drv=>this%sdr
+        else
+            drv=>this%dr
+        end if
+    end subroutine
+
+
+    subroutine gpu_dcgto(rr1, ctr1, ax, val)
+        real(DP), dimension(:), intent(in) :: rr1
+        type(gpu_contraction_t), intent(in), target :: ctr1
+        integer(I4), intent(in) :: ax
+        real(DP), dimension(:), intent(out) :: val
+
+        real(DP) :: bfval, dbfval
+        real(DP), dimension(:,:), pointer, device :: g
+        real(DP), dimension(3) :: df
+        real(DP) :: up, down
+        integer(I4) :: i6, j3
+        real(DP) :: rr3
+
+        rr3=sum(rr1**2)
+
+        g=>GTO_DEFS(ctr1%l)%nlm ! WARN: ARE GOTs defined on device?
+        call gpu_cao2(ctr1, rr3, bfval, dbfval)
+        do i6=1,ctr1%nccomp
+            df=g(:,i6)
+            df(ax)=df(ax)-1.d0
+            if (df(ax) < D0) df(ax)=D0
+            down=g(ax,i6)*product(rr1**df)*bfval
+            up=2.d0*rr1(ax)*product(rr1**g(:,i6))*dbfval
+            val(i6)=down-up
+        end do
+    end subroutine
+
+    subroutine gpu_cao2(cc, rr4, vcao, vdcao)
+        type(gpu_contraction_t), intent(in)  :: cc
+        real(DP), intent(in) :: rr4
+        real(DP), intent(out) :: vcao, vdcao
+
+        integer(I4) :: i7
+        real(DP) :: q1
+
+        vcao=D0
+        vdcao=D0
+        do i7=1,cc%npf
+            q1=cc%ncc(i)*exp(-cc%xp(i)*rr4)
+!            if (abs(q) < 1.d-20) cycle
+            vcao=vcao+q
+            vdcao=vdcao+cc%xp(i)*q
+        end do
+    end subroutine
+
+
+    subroutine gpu_mkdbop(this, rr1)
+        type(gpu_bfeval_t) :: this
+        real(DP), dimension(3), intent(in) :: rr1
+
+        type(gpu_atom_t), pointer :: atom1
+        real(DP) :: Rx, Ry, Rz
+        real(DP), dimension(3) :: coord1
+        integer(I4) :: i5, n_atoms
+
+        n_atoms=this%mol%natoms
+
+        do i5=1,n_atoms
+            atom1=>this%mol%atoms(i5)
+            coord1 = atom1%coord
+            Rx=coord1(1)
+            Ry=coord1(2)
+            Rz=coord1(3)
+            this%dbop(1,i5)=(r(2)*Rz-r(3)*Ry)
+            this%dbop(2,i5)=(r(3)*Rx-r(1)*Rz)
+            this%dbop(3,i5)=(r(1)*Ry-r(2)*Rx)
+        end do
+    end subroutine
+
+    subroutine gpu_d2fdrdb(this, bfvec, drvec, thisv)
+        type(gpu_bfeval_t) :: this
+        real(DP), dimension(:), intent(in) :: bfvec
+        real(DP), dimension(:,:), intent(in) :: drvec
+        real(DP), dimension(:,:), pointer :: thisv
+
+        type(gpu_atom_t), dimension(:), pointer :: atoms
+        integer(I4) :: i5, j2, k1, n_atoms, n_ctr, n_comp, idx3
+        real(DP), dimension(3) :: coord1
+        type(gpu_atom_t), pointer :: atom1
+        type(gpu_basis_t), pointer :: basis1
+        type(gpu_contraction_t), pointer :: ctr1
+
+        integer(I4), dimension(99) :: posvec1
+        integer(I4) :: l1
+        real(DP), dimension(3) :: dbov
+        real(DP) :: ror1, ror2, ror3
+
+        n_atoms=this%mol%natoms
+
+        idx=1
+        this%d2=0.d0
+        do i5=1,natoms
+            atom1=>this%mol%atoms(i5)
+            dbov=this%dbop(:,i5)
+            coord1 = atom1%coord
+            ror1=coord1(1)
+            ror2=coord1(2)
+            ror3=coord1(3)
+            basis1=>atom1%basis
+            n_ctr=basis1%nctr
+            do j2=1,n_ctr
+                ctr1=>basis1%ctr(j2) ! WARN: REPLACED GET_CONTRACTION 
+                n_comp=ctr1%nccomp
+                do k1=1,n_comp
+
+                    ! dBx
+                    this%d2(idx3,1)=drvec(idx3,1)*dbov(1)                  ! dx
+                    this%d2(idx3,2)=drvec(idx3,2)*dbov(1)+ror3*bfvec(idx3)  ! dy
+                    this%d2(idx3,3)=drvec(idx3,3)*dbov(1)-ror2*bfvec(idx3)  ! dz
+
+                    ! dBy
+                    this%d2(idx3,4)=drvec(idx3,1)*dbov(2)-ror3*bfvec(idx3)
+                    this%d2(idx3,5)=drvec(idx3,2)*dbov(2)
+                    this%d2(idx3,6)=drvec(idx3,3)*dbov(2)+ror1*bfvec(idx3)
+
+                    ! dBz
+                    this%d2(idx3,7)=drvec(idx3,1)*dbov(3)+ror2*bfvec(idx3)
+                    this%d2(idx3,8)=drvec(idx3,2)*dbov(3)-ror1*bfvec(idx3)
+                    this%d2(idx3,9)=drvec(idx3,3)*dbov(3)
+                    idx3=idx3+1
+                end do
+            end do
+        end do
+        thisv=>this%d2
+    end subroutine
+
+    subroutine gpu_dfdb(this, bfvec, dbv)
+        type(gpu_bfeval_t) :: this
+        real(DP), dimension(:), intent(in) :: bfvec
+        real(DP), dimension(:,:), pointer :: dbv
+
+        type(atom_t), pointer :: atom1
+        type(basis_t), pointer :: basis1
+        integer(I4) :: i5, j2, k1, n_atoms, n_cgto
+
+        n_atoms=this%mol%natoms
+
+        j2=1
+        do k1=1,n_atoms
+            atom1=>this%mol%atoms(k1)
+            basis1=>atom1%basis
+            n_cgto=basis%ncgto
+            do i5=1,n_cgto
+                this%db(j2,:)=this%dbop(:,k1)*bfvec(j2)
+                j2=j2+1
+            end do
+        end do
+        dbv=>this%db
+    end subroutine
+

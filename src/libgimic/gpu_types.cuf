@@ -1,0 +1,112 @@
+
+module gpu_data
+    use cudafor
+    use gaussint_module
+    use kinds_module
+    implicit none
+    
+    type gpu_gto_jar
+        integer(I4) :: l, ncomp
+        real(DP), allocatable, device :: nlm(:,:)
+    end type
+
+    type gpu_cao2sao_t
+        real(DP), allocatable, device :: po(:,:)
+    end type
+
+    type gpu_contraction_t
+        integer(I4), device :: npf,ncf,l,ncomp,nccomp ! n prims, n contrs, l-qnumber
+        real(DP), allocatable, device :: xp(:)
+        real(DP), allocatable, device :: cc(:)! cc:s
+        real(DP), allocatable, device :: ncc(:) ! norm cc:s
+    end type
+
+    type gpu_basis_t
+        integer(I4), device :: lmax, nctr, nshells, ncgto, ngto
+        integer, dimension(MAX_L+1), device :: nctrps ! contractions per shell
+        type(gpu_contraction_t), allocatable,, device :: ctr(:) ! s_n, p_n...
+        real(DP), allocatable, device :: thrs(:) ! screening
+        integer(I4), allocatable, device :: pos(:) ! starting idx for n:th ctr
+    end type gpu_basis_t
+
+    type gpu_atom_t
+        character(2), device :: symbol
+        character(2), device :: id
+        real(DP), dimension(3), device :: coord
+        real(DP), device :: charge
+        type(gpu_basis_t), allocatable, device :: basis
+    end type gpu_atom_t
+
+    type gpu_molecule_t
+        integer(I4), device :: natoms
+        type(gpu_atom_t), allocatable, device :: atoms(:)
+        integer(I4), device :: ngto, ncgto, nccgto
+        type(gpu_cao2sao_t), allocatable, device :: c2s
+    end type gpu_molecule_t
+
+    type gpu_dens_t
+        type(gpu_molecule_t), allocatable, device :: mol
+        real(DP), allocatable, device :: da(:,:,:)
+        real(DP), allocatable, device :: db(:,:,:)
+        logical, device :: pdens_p=.true.
+        integer(I4), device :: spin
+    end type gpu_dens_t
+
+    type gpu_gdata_t
+        real(DP), allocatable, device :: pts(:), wgt(:)
+    end type gpu_gdata_t
+
+    type gpu_grid_t
+        logical, device :: gauss  ! integration grid, 1,2 or 3-D
+        real(DP), dimension(3,3), device :: basv   ! grid basis vectors
+        real(DP), dimension(3), device :: l        ! |v|
+        real(DP), dimension(3), device :: origin, ortho
+        real(DP), dimension(3), device :: step
+        integer(I4), dimension(3), device :: npts
+        type(gpu_gdata_t), dimension(3), device :: gdata
+        character(BUFLEN), device :: mode, gtype
+        real(DP), allocatable, device :: xdata(:)
+        integer(I4), device :: gauss_order
+        real(DP), device :: radius
+    end type gpu_grid_t
+
+    type gpu_bfeval_t
+        private
+        type(gpu_molecule_t), allocatable, device :: mol
+        real(DP), allocatable, device :: bf(:)
+        real(DP), allocatable, device :: sbf(:)
+        real(DP), allocatable, device :: dbop(:,:)
+        real(DP), allocatable, device :: d2(:,:)
+        real(DP), allocatable, device :: db(:,:)
+        real(DP), allocatable, device :: dr(:,:)
+        real(DP), allocatable, device :: sdr(:,:)
+        integer(I4), device :: ptn
+    end type gpu_bfeval_t
+
+    type gpu_jtensor_t
+        private
+        type(gpu_molecule_t), pointer, device :: mol
+        type(gpu_dens_t), pointer, device :: xdens
+        type(gpu_bfeval_t), allocatable, device :: basv
+        real(DP), allocatable, device :: pdbf(:), denbf(:), dendb(:)
+        real(DP), allocatable, device :: rho(3)
+        ! scratch mem
+        real(DP), allocatable, device :: bfvec(:)
+        real(DP), allocatable, device :: dbvec(:,:), drvec(:,:), d2fvec(:,:), dbop(:,:)
+        real(DP), device, pointer :: aodens(:,:), pdens(:,:)
+    end type gpu_jtensor_t
+
+
+    type gpu_integral_t
+        type(gpu_molecule_t), allocatable, device :: mol
+        type(gpu_dens_t), allocatable, device :: xdens
+        type(gpu_grid_t), allocatable, device :: grid
+        integer(I4), device :: ncgto, p1, p2, p3
+        real(DP), dimension(3), device :: normal, center, bb
+        real(DP) :: psum, nsum, w, jp, r, bound, sgn
+        real(DP), dimension(3), device :: jvec
+        real(DP), dimension(9), device :: tt
+
+        character(8), device :: spin
+
+    end type gpu_integral_t

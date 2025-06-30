@@ -1,0 +1,205 @@
+
+module gpu_utils
+    use cudafor
+    use gaussint_module
+    use kinds_module
+    use settings_module
+    use jtensor_class
+    use gpu_data
+    implicit none
+
+
+contains
+    function check_gpu_availability() result(gpu_available)
+        implicit none
+        logical :: gpu_availability
+        integer :: istat, deviceCount
+
+        istat = cudaGetDeviceCount(deviceCount)
+        gpu_availability = (istat == cudaSuccess .and. deviceCount > 0)
+    end function check_gpu_availability
+
+    subroutine copy_data_gpu(gpu_integral, mol, xdens, p1, p2, p3, spin, bb, center, normal)
+        implicit none
+        type(molecule_t), intent(in) :: mol
+        type(dens_t), intent(in) :: xdens
+        type(gpu_integral_t), intent(out), device :: gpu_integral
+        integer(I4), intent(in) ::  p1, p2, p3
+        character(8), intent(in) :: spin
+        real(DP), dimension(3), intent(in) :: normal, center, bb
+
+
+
+        gpu_integral%ncgto=get_ncgto(mol)
+
+        gpu_integral%p1 = p1
+        gpu_integral%p2 = p2
+        gpu_integral%p3 = p3
+        gpu_integral%spin = spin
+
+        gpu_integral%bb = bb
+        gpu_integral%normal = normal
+        gpu_integral%center = center
+
+        allocate(gpu_integral%mol)
+        allocate(gpu_integral%xdens)
+
+        call copy_molecule(gpu_integral%%mol, mol)
+        call copy_xdens(gpu_integral%xdens, xdens)
+
+        ! allocate(gpu_integral%jt%basv)
+        ! gpu_integral%jt%basv%mol=>gpu_integral%jt%mol
+        ! call allocate_basv(gpu_integral%jt%basv, jt%basv)
+
+        ! allocate(gpu_integral%jt%denbf(ncgto))
+        ! allocate(gpu_integral%jt%dendb(ncgto))
+        ! allocate(gpu_integral%jt%pdbf(ncgto))
+    end subroutine
+
+    ! subroutine allocate_basv(gpu_basv, basv)
+    !     type(bfeval_t), intent(in) :: basv
+    !     type(gpu_bfeval_t), intent(out) :: gpu_basv
+
+    !     allocate(gpu_basv%bf(get_ncgto(basv%mol)))
+    !     allocate(gpu_basv%dbop(3,get_natoms(basv%mol)))
+    !     allocate(gpu_basv%d2(get_ncgto(basv%mol),9))
+    !     allocate(gpu_basv%db(get_ncgto(basv%mol),3))
+    !     allocate(gpu_basv%dr(get_nccgto(basv%mol),3))
+    !     if (settings%use_spherical) allocate(gpu_basv%sdr(get_ncgto(basv%mol),3))
+    !     if (settings%use_spherical) allocate(gpu_basv%sbf(get_nccgto(basv%mol)))
+
+    ! end subroutine
+    
+    subroutine copy_xdens(gpu_xdens, xdens)
+        type(dens_t), intent(in) :: xdens
+        type(gpu_dens_t), intent(out) :: gpu_xdens
+
+        integer(I4) :: i, j, k, b, ncgto
+
+        ! Skipping molecule copy,  since it is already copied in copy_molecule to jt%mol
+        ncgto=get_ncgto(xdens%mol)
+
+        gpu_xdens%pdens_p = xdens%pdens_p
+
+        gpu_xdens%spin = xdens%spin
+
+        if (xdens%pdens_p) then
+            b = 3
+            allocate(gpu_xdens%da(ncgto,ncgto,0:3))
+            if (settings%is_uhf) allocate(gpu_xdens%db(ncgto,ncgto,0:3))
+        else
+            b = 0
+            allocate(gpu_xdens%da(ncgto,ncgto,0:0))
+            if (settings%is_uhf) allocate(gpu_xdens%db(ncgto,ncgto,0:0))
+        end if
+
+        do i = 1, ncgto
+            do j = 1, ncgto
+                do k = 0, b
+                    gpu_xdens%da(i,j,k) = xdens%da(i,j,k)
+                    if (settings%is_uhf) then
+                        gpu_xdens%db(i,j,k) = xdens%db(i,j,k)
+                    end if
+                end do
+            end do
+        end do
+
+    end subroutine
+
+    subroutine copy_molecule(gpu_molec, molec)
+        type(molecule_t), intent(in) :: molec
+        type(gpu_molecule_t), intent(in) :: gpu_molec
+        integer(I4) :: i, natoms
+
+        gpu_molec%natoms = molec%mol%natoms
+        gpu_molec%ngto = molec%mol%ngto
+        gpu_molec%ncgto = molec%mol%ncgto
+        gpu_molec%nccgto = molec%mol%nccgto
+
+        natoms =molec%natoms
+        allocate(gpu_atoms(natoms))
+
+        do i=1,natoms
+            call copy_atoms(gpu_molec%atoms(i), molec%atoms(i))
+        end do
+        call copy_c2s(gpu_molec%c2s, molec%c2s)
+
+    end subroutine
+
+    subroutine copy_atoms(gpu_atoms, atoms)
+        type(atom_t), intent(in) :: atoms
+        type(gpu_atom_t), intent(out) :: gpu_atoms
+
+        gpu_atoms%symbol = atoms%symbol
+        gpu_atoms%id = atoms%id
+        gpu_atoms%coord(1) = atoms%coord(1)
+        gpu_atoms%coord(2) = atoms%coord(2)
+        gpu_atoms%coord(3) = atoms%coord(3)
+        gpu_atoms%charge = atoms%charge
+
+        allocate(gpu_atoms%basis)
+        call copy_basis(gpu_atoms%basis, atoms%basis)
+
+    end subroutine 
+
+    subroutine copy_basis(gpu_basis, basis)
+        type(basis_t), intent(in) :: basis
+        type(gpu_basis_t), intent(out) :: gpu_basis
+        integer(I4) :: i, nctr
+
+        nctr = basis%nctr
+        gpu_basis%lmax = basis%lmax
+        gpu_basis%nctr = basis%nctr
+        gpu_basis%ngto = basis%ngto
+        gpu_basis%ncgto = basis%ncgto
+        gpu_basis%nshells = basis%nshells
+
+        do i=1,MAX_L+1
+            gpu_basis%nctrps(i) = basis%nctrps(i)
+        end do
+
+        allocate(gpu_basis%ctr(nctr))
+        do i=1,nctr
+            call copy_ctr(gpu_basis%ctr(i), basis%ctr(i))
+        end do
+
+        allocate(gpu_basis%thrs(nctr)) 
+        allocate(gpu_basis%pos(nctr)) 
+
+        do i=1,nctr
+            gpu_basis%thrs(i) = basis%thrs(i)
+            gpu_basis%pos(i) = basis%pos(i)
+        end do
+
+    end subroutine
+
+    subroutine copy_ctr(gpu_ctr, ctr)
+        type(contraction_t), intent(in) :: ctr
+        type(gpu_contraction_t), intent(out) :: gpu_ctr
+        integer(I4) :: i, npf
+
+        gpu_ctr%l = ctr%l
+        gpu_ctr%npf = ctr%npf
+        gpu_ctr%ncf = ctr%ncf
+        gpu_ctr%ncomp = ctr%ncomp
+        gpu_ctr%nccomp = ctr%nccomp
+
+        npf = ctr%npf
+        allocate(gpu_ctr%xp(npf))
+        allocate(gpu_ctr%cc(npf))
+        allocate(gpu_ctr%ncc(npf))
+
+        do i=1,npf
+            gpu_ctr%xp(i) = ctr%xp
+            gpu_ctr%cc(i) = ctr%cc
+            gpu_ctr%ncc(i) = ctr%ncc
+        end do
+
+    end subroutine
+
+    subroutine copy_c2s(gpu_c2s, c2s)
+        type(cao2sao_t), intent(in) :: c2s
+        type(gpu_cao2sao_t), intent(out) :: gpu_c2s
+
+
+    end subroutine
